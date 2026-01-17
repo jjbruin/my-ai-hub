@@ -1,5 +1,5 @@
 import streamlit as st
-import hmac, smtplib, pandas as pd
+import hmac, smtplib
 from openai import OpenAI
 from tavily import TavilyClient
 
@@ -21,51 +21,46 @@ if check_password():
     st.set_page_config(page_title="AI Intelligence Hub", layout="wide")
     st.title("⚖️ Private AI Intelligence Hub")
     
-    query = st.chat_input("Enter your research query...")
+    query = st.chat_input("Ask about the Eagles vs 49ers...")
 
     if query:
-        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86OWQwYzFkNzhlODM3ZDE3NzU2ZDliNDZkNzNhYjk5MzI6Nzo2NTE2OmU2MjQwYTdiY2UwMjU5MzVkZWVmM2U3NzJjNjYxMTNiMjI0ODkxYWVhYzVjOTg4NmE3NjNmYmE3MDE2MWM3ODg6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
+        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86OTBjNDE5NmUwOWRlMzI1ZmU1OWQ5ZDk0MDZiYmI0NTI6NzpiODE2OmQ1NmY4Mzc5MmM2ODA0YWQ0NWQ5YmY3MjE2YWFiMDJiMTg5MjE1MDY1YzAzMzUxZjNiOThlMTc2ODkzNmM4Y2E6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
         tv = TavilyClient(api_key=st.secrets["TAVILY_KEY"])
 
         with st.status("Gathering Intelligence...", expanded=True) as status:
-            # A. Search
-            st.write("🔎 Web Audit...")
+            # A. Search (Limit to 1 result, 300 characters only)
+            st.write("🔎 Reading one news source...")
             try:
-                res = tv.search(query, search_depth="basic", max_results=2)
-                web = "\n".join([r['content'][:300] for r in res.get('results', [])])
+                res = tv.search(query, search_depth="basic", max_results=1)
+                web_raw = res.get('results', [])[0]['content'] if res.get('results') else "No facts."
+                web = web_raw[:300] # HARD CUT: Only 300 characters
             except: web = "Search error."
 
-            # B. Experts (Forced to be tiny to save the Judge)
-            st.write("🤖 Consulting Board...")
-            experts = ["anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"]
-            summaries = []
-            
-            for m in experts:
-                try:
-                    r = ai.chat.completions.create(
-                        model=m,
-                        messages=[{"role": "user", "content": f"Answer in 3 SHORT bullets only: {web}\n\nQ: {query}"}]
-                    )
-                    summaries.append(r.choices[0].message.content)
-                except: summaries.append("- Expert unavailable.")
+            # B. Single Expert Summary
+            st.write("🤖 Expert Analysis...")
+            try:
+                # Ask for a VERY short answer
+                r1 = ai.chat.completions.create(
+                    model="openai/gpt-4o-mini",
+                    messages=[{"role": "user", "content": f"Answer in 50 words: {web}\n\nQ: {query}"}]
+                )
+                expert_view = r1.choices[0].message.content[:400]
+            except: expert_view = "Expert failed."
 
-            # C. THE JUDGE (Receiving a small, safe packet)
+            # C. THE JUDGE (Receiving a tiny packet)
             st.write("⚖️ Final Audit...")
             try:
-                judge_input = "\n".join(summaries)
                 final = ai.chat.completions.create(
                     model="google/gemini-2.0-flash-exp",
-                    messages=[{"role": "user", "content": f"Synthesize these bullets into a final report: {judge_input}"}]
+                    messages=[{"role": "user", "content": f"Final report: {expert_view}"}]
                 )
                 st.session_state.report = final.choices[0].message.content
                 status.update(label="✅ Success", state="complete")
             except Exception:
-                st.error("The network is still too crowded. Please try a simpler question.")
+                st.error("The network blocked the Final Judge. Try a simpler topic.")
 
     if "report" in st.session_state:
         st.divider()
         st.markdown(st.session_state.report)
-
-
 
 
