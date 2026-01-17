@@ -2,7 +2,8 @@ import streamlit as st
 import hmac, smtplib
 from openai import OpenAI
 from tavily import TavilyClient
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # --- 1. LOGIN ---
 def check_password():
@@ -49,18 +50,38 @@ if check_password():
             except: expert_view = "Expert failed."
 
             # C. THE JUDGE (Direct Google bypass)
-            st.write("⚖️ Final Audit...")
+            st.write("⚖️ Final Audit (Thinking Mode Enabled)...")
             try:
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                response = model.generate_content(f"You are the Final Judge. Synthesize this expert report: {expert_view}")
-                st.session_state.report = response.text
-                status.update(label="✅ Success", state="complete")
+                client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=f"Compare these reports and judge the true winner and controversies: {expert_view}",
+                    config=types.GenerateContentConfig(
+                        #Enable thinking with a budget of 4,000 reasoning tokens
+                        thinking_config=types.ThinkingConfig(
+                            thinking_budget=4000,
+                            include_thoughts=True  # This allows you to see the logic
+                        )
+                    )
+                )
+                # Store the final report
+            st.session_state.report = response.text
+
+            # Optional: Display the model's internal reasoning in an expander
+            with st.expander("View Judge's Internal Reasoning"):
+                for part in response.candidates[0].content.parts:
+                    if part.thought:
+                        st.info(part.text)
+
+            status.update(label="👌Success", state="complete")
+            
             except Exception as e:
-                st.error(f"Critical System Error: {e}")
+                st.error(f"Migration Error: {e}")
 
     if "report" in st.session_state:
         st.divider()
         st.markdown(st.session_state.report)
+
 
 
 
