@@ -2,6 +2,7 @@ import streamlit as st
 import hmac, smtplib
 from openai import OpenAI
 from tavily import TavilyClient
+import google.generativeai as genai
 
 # --- 1. LOGIN ---
 def check_password():
@@ -21,46 +22,42 @@ if check_password():
     st.set_page_config(page_title="AI Intelligence Hub", layout="wide")
     st.title("⚖️ Private AI Intelligence Hub")
     
-    query = st.chat_input("Ask about the Eagles vs 49ers...")
+    query = st.chat_input("Enter your research query...")
 
     if query:
-        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86OTBjNDE5NmUwOWRlMzI1ZmU1OWQ5ZDk0MDZiYmI0NTI6NzpiODE2OmQ1NmY4Mzc5MmM2ODA0YWQ0NWQ5YmY3MjE2YWFiMDJiMTg5MjE1MDY1YzAzMzUxZjNiOThlMTc2ODkzNmM4Y2E6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
+        # Initialize Clients
+        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86NTI1OWU1ZTM1MWEwNDdhYmZlOGNlOGM0ZGIwOTJjNTE6Nzo1NWNiOmU4OWY4ODdlNGZmYzM4OTg1ZjBlMzRiNjgzNzM2Y2IyMjY5MDU0OTA3NTgyZWNiM2RmZDhkYTUwMGMwNDE0YWY6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
         tv = TavilyClient(api_key=st.secrets["TAVILY_KEY"])
-
+        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"]) # Direct Google Connection
+        
         with st.status("Gathering Intelligence...", expanded=True) as status:
-            # A. Search (Limit to 1 result, 300 characters only)
-            st.write("🔎 Reading one news source...")
+            # A. Search
+            st.write("🔎 Web Audit...")
             try:
                 res = tv.search(query, search_depth="basic", max_results=1)
-                web_raw = res.get('results', [])[0]['content'] if res.get('results') else "No facts."
-                web = web_raw[:300] # HARD CUT: Only 300 characters
+                web = res.get('results', [])[0]['content'][:1000] if res.get('results') else "No facts."
             except: web = "Search error."
 
-            # B. Single Expert Summary
-            st.write("🤖 Expert Analysis...")
+            # B. Expert Analysis (Via OpenRouter)
+            st.write("🤖 Expert Board...")
             try:
-                # Ask for a VERY short answer
                 r1 = ai.chat.completions.create(
                     model="openai/gpt-4o-mini",
-                    messages=[{"role": "user", "content": f"Answer in 50 words: {web}\n\nQ: {query}"}]
+                    messages=[{"role": "user", "content": f"Analyze: {web}\n\nQ: {query}"}]
                 )
-                expert_view = r1.choices[0].message.content[:400]
+                expert_view = r1.choices[0].message.content
             except: expert_view = "Expert failed."
 
-            # C. THE JUDGE (Receiving a tiny packet)
+            # C. THE JUDGE (Direct Google bypass)
             st.write("⚖️ Final Audit...")
             try:
-                final = ai.chat.completions.create(
-                    model="google/gemini-2.0-flash-exp",
-                    messages=[{"role": "user", "content": f"Final report: {expert_view}"}]
-                )
-                st.session_state.report = final.choices[0].message.content
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                response = model.generate_content(f"You are the Final Judge. Synthesize this expert report: {expert_view}")
+                st.session_state.report = response.text
                 status.update(label="✅ Success", state="complete")
-            except Exception:
-                st.error("The network blocked the Final Judge. Try a simpler topic.")
+            except Exception as e:
+                st.error(f"Critical System Error: {e}")
 
     if "report" in st.session_state:
         st.divider()
         st.markdown(st.session_state.report)
-
-
