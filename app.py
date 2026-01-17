@@ -2,10 +2,6 @@ import streamlit as st
 import hmac, smtplib, pandas as pd
 from openai import OpenAI
 from tavily import TavilyClient
-from PyPDF2 import PdfReader
-from docx import Document
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 # --- 1. SECURITY ---
 def check_password():
@@ -20,59 +16,62 @@ def check_password():
         else: st.error("Invalid Login")
     return False
 
-def extract_text(file):
-    try:
-        ext = file.name.split('.')[-1].lower()
-        if ext == 'pdf': return " ".join([p.extract_text() for p in PdfReader(file).pages])
-        if ext == 'docx': return " ".join([p.text for p in Document(file).paragraphs])
-        if ext == 'csv': return pd.read_csv(file).to_string()
-    except: return "Error reading file."
-    return ""
-
 # --- 2. MAIN HUB ---
 if check_password():
     st.set_page_config(page_title="AI Intelligence Hub", layout="wide")
-    if "history" not in st.session_state: st.session_state.history = []
-
     st.title("⚖️ Private AI Intelligence Hub")
-    up_file = st.file_uploader("Upload files", type=['pdf', 'csv', 'docx'])
-    query = st.chat_input("Ask about the Eagles vs 49ers...")
+    
+    query = st.chat_input("Enter your research query...")
 
     if query:
-        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86ZTA4MGU0NmJlNGE3ZDcxMDE0NmY3YWVhOWJmMGI3NjA6NzpkMjJiOjkwMDg5NTg1NDY3MGY2YTY3ODY0NWVmOGM1MDRkOGQzNGMyOTcwMzNlYzg3MjQ4NzZlMGU1MjY3ZTczZjFmM2Y6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
+        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86NmM0NjNlZDg0NmZmOTgwZjYxM2ExNGQwOGQ5ZmFmODA6Nzo2OTdmOjQ5ZWJmZDM2ZjJmNWMxMWNhYTBiMzlkOGVkMjczZDEzOTZmYTA1NjY4YmQxZGNjMjRiYjNkYTk3ZDQ1MDkzNWM6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
         tv = TavilyClient(api_key=st.secrets["TAVILY_KEY"])
-        doc = extract_text(up_file) if up_file else "None."
 
         with st.status("Gathering Intelligence...", expanded=True) as status:
-            # A. Search (CRITICAL FIX: Limit to only 2 results to keep packet small)
+            # A. Targeted Search
+            st.write("🔎 Performing live web audit...")
             try:
-                res = tv.search(query, search_depth="basic", max_results=2)
-                web = "\n".join([r['content'][:500] for r in res.get('results', [])])
-            except: web = "Search error."
+                res = tv.search(query, search_depth="basic", max_results=3)
+                # Keep only the most relevant snippet of each result
+                web = "\n".join([r['content'][:400] for r in res.get('results', [])])
+            except: web = "Web data limited."
 
-            # B. Experts (Drastic Truncation to bypass CloudFront)
-            st.write("🤖 Consulting Experts...")
-            prompt = f"Data: {web}\n\nQuestion: {query}"
+            # B. The Board of Experts
+            st.write("🤖 Consulting Board of Experts...")
+            experts = ["anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"]
             answers = []
-            for m in ["anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"]:
-                try:
-                    r = ai.chat.completions.create(model=m, messages=[{"role": "user", "content": prompt[:1000]}])
-                    answers.append(r.choices[0].message.content)
-                except: answers.append("Expert unavailable.")
             
-            # C. Final Synthesis
-            st.write("⚖️ Finalizing Audit...")
+            for m in experts:
+                try:
+                    # We ask the experts to be extremely brief to save bandwidth for the judge
+                    r = ai.chat.completions.create(
+                        model=m,
+                        messages=[{"role": "user", "content": f"Briefly answer based on this: {web}\n\nQ: {query}"}]
+                    )
+                    answers.append(r.choices[0].message.content)
+                except: answers.append(f"Expert {m} timed out.")
+
+            # C. THE FINAL JUDGE (The core of the app)
+            st.write("⚖️ Final Audit & Synthesis...")
             try:
-                judge_input = "\n".join([a[:500] for a in answers])
+                # We send the expert findings to the Judge
+                expert_inputs = "\n\n".join([f"Expert {i+1}: {ans[:600]}" for i, ans in enumerate(answers)])
+                
                 final = ai.chat.completions.create(
                     model="google/gemini-2.0-flash-exp",
-                    messages=[{"role": "user", "content": f"Summarize these findings: {judge_input}"}]
+                    messages=[
+                        {"role": "system", "content": "You are the Final Judge. Synthesize the expert views into one verified report."},
+                        {"role": "user", "content": f"Expert Perspectives:\n{expert_inputs}"}
+                    ]
                 )
-                res_obj = {"q": query, "report": final.choices[0].message.content}
-                st.session_state.history.append(res_obj); st.session_state.view = res_obj
-                status.update(label="✅ Complete", state="complete")
-            except: st.error("Network limit reached. Try a more specific question.")
+                st.session_state.report = final.choices[0].message.content
+                status.update(label="✅ Final Audit Complete", state="complete")
+            except Exception as e:
+                st.error(f"The Final Judge was blocked by a network limit. Try a more specific query.")
 
-    if "view" in st.session_state:
+    if "report" in st.session_state:
         st.divider()
-        st.markdown(st.session_state.view['report'])
+        st.markdown("### 📝 Verified Final Report")
+        st.markdown(st.session_state.report)
+
+
