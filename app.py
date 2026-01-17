@@ -7,99 +7,80 @@ from docx import Document
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# --- DIAGNOSIS: Remove this line once the app works --- st.sidebar.write("System Keys Found:", list(st.secrets.keys()))
-
-# --- 1. SECURITY: MULTI-USER LOGIN ---
+# --- 1. SECURITY & UTILS ---
 def check_password():
     if st.session_state.get("password_correct", False): return True
-    st.title("🔐 Secure Intelligence Hub Login")
-    user_input = st.text_input("Username")
-    password_input = st.text_input("Password", type="password")
+    st.title("🔐 Intelligence Hub Login")
+    u, p = st.text_input("Username"), st.text_input("Password", type="password")
     if st.button("Login"):
-        user_db = st.secrets.get("passwords", {})
-        if user_input in user_db and hmac.compare_digest(password_input, user_db[user_input]):
-            st.session_state["password_correct"] = True
-            st.session_state["current_user"] = user_input
+        db = st.secrets.get("passwords", {})
+        if u in db and hmac.compare_digest(p, db[u]):
+            st.session_state["password_correct"], st.session_state["user"] = True, u
             st.rerun()
-        else:
-            st.error("😕 Invalid username or password")
+        else: st.error("Invalid Login")
     return False
 
-# --- 2. UTILITIES ---
 def extract_text(file):
     try:
         ext = file.name.split('.')[-1].lower()
         if ext == 'pdf': return " ".join([p.extract_text() for p in PdfReader(file).pages])
         if ext == 'docx': return " ".join([p.text for p in Document(file).paragraphs])
         if ext == 'csv': return pd.read_csv(file).to_string()
-    except Exception as e: return f"Error: {str(e)}"
+    except Exception as e: return f"Error: {e}"
     return ""
 
-def send_report(text, subject):
-    try:
-        msg = MIMEMultipart(); msg['Subject'] = f"AI Research: {subject}"
-        msg['From'] = st.secrets["EMAIL_SENDER"]; msg['To'] = st.secrets["EMAIL_SENDER"]
-        msg.attach(MIMEText(text, 'plain'))
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls(); server.login(st.secrets["EMAIL_SENDER"], st.secrets["EMAIL_APP_PASSWORD"])
-            server.send_message(msg)
-        st.success("Sent!")
-    except Exception as e: st.error(f"Failed: {e}")
-
-# --- 3. MAIN APP ---
+# --- 2. MAIN HUB ---
 if check_password():
     st.set_page_config(page_title="AI Intelligence Hub", layout="wide")
     if "history" not in st.session_state: st.session_state.history = []
 
     with st.sidebar:
-        st.success(f"User: {st.session_state['current_user']}")
-        st.header("📜 History")
+        st.success(f"User: {st.session_state['user']}")
         for i, h in enumerate(st.session_state.history):
-            if st.button(f"{i+1}. {h['q'][:20]}...", key=f"h_{i}"): st.session_state.view = h
+            if st.button(f"{h['q'][:20]}...", key=f"h_{i}"): st.session_state.view = h
 
     st.title("⚖️ Private AI Intelligence Hub")
     up_file = st.file_uploader("Upload files", type=['pdf', 'csv', 'docx'])
     query = st.chat_input("Ask anything...")
 
     if query:
-        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86N2NmYmQzNjk0ZjFkOTFkMmU1OGI4YjA5NmI5NmE3OGY6NzozMGE2OjRjYTQ1MDE5MzQzYWIzNGZjY2M0NmI1NmNlZDljMDIxN2I4NzJkNDRkNzAxMWRjZDFhYmQ3NzIyMjllM2NlM2I6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
+        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86OGQ1ZTE4YWMyMjEwMjZlYzdmZWE3YWVhMzZmYTc2ZTM6NzozZDBmOmRmYjQ1YWQxN2NhZjA5MGM4NTA1YzE5NTYxYzg0ZTVhNDAwNjM3ODlhYjhjMGJkYjg4M2FiMzU3MTBmYjRkMjg6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
         tv = TavilyClient(api_key=st.secrets["TAVILY_KEY"])
-        doc_txt = extract_text(up_file) if up_file else "None."
+        doc = extract_text(up_file) if up_file else "None."
 
         with st.status("Gathering Intelligence...", expanded=True) as status:
-            # A. Web Search
+            # A. Search
             try:
-                search_res = tv.search(query, search_depth="advanced")
-                web = "\n".join([r['content'] for r in search_res.get('results', [])])
-            except: web = "Web search unavailable."
+                res = tv.search(query, search_depth="advanced")
+                web = "\n".join([r['content'] for r in res.get('results', [])])
+            except: web = "Search error."
 
-            # B. Experts (Limited to 2000 chars to prevent CloudFront 403 errors)
+            # B. Experts (Shortened to 1500 characters)
             st.write("🤖 Consulting Experts...")
-            experts = ["anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"] # Using mini to test stability
+            prompt = f"Doc: {doc[:1500]}\nWeb: {web[:1500]}\nQ: {query}"
             answers = []
-            prompt = f"Doc: {doc_txt[:2000]}\nWeb: {web[:2000]}\nQ: {query}"
-            
-            for m in experts:
+            for m in ["anthropic/claude-3.5-sonnet", "openai/gpt-4o-mini"]:
                 try:
-                    res = ai.chat.completions.create(model=m, messages=[{"role": "user", "content": prompt}])
-                    answers.append(res.choices[0].message.content)
-                except Exception as e: answers.append(f"Expert {m} failed: {e}")
+                    r = ai.chat.completions.create(model=m, messages=[{"role": "user", "content": prompt}])
+                    answers.append(r.choices[0].message.content)
+                except Exception as e: answers.append(f"Model failed: {e}")
             
-            # C. Final Judge (Forced small prompt to bypass CloudFront)
-            st.write("⚖️ Finalizing...")
+            # C. Final Synthesis (Crucial: Drastically shortened to avoid CloudFront errors)
+            st.write("⚖️ Finalizing Audit...")
             try:
-                summary = "\n\n".join([f"Expert {i+1}: {ans[:1000]}" for i, ans in enumerate(answers)])
-                final_res = ai.chat.completions.create(
-                    model="google/gemini-2.0-flash-exp", # Using faster Flash model
-                    messages=[{"role": "user", "content": f"Compare these views and give a final report:\n{summary}"}]
+                # We only send the first 800 characters of each expert answer to the judge
+                judge_input = "\n\n".join([f"Expert {i+1}: {a[:800]}" for i, a in enumerate(answers)])
+                final = ai.chat.completions.create(
+                    model="google/gemini-2.0-flash-exp",
+                    messages=[{"role": "user", "content": f"Briefly summarize these views into a report:\n{judge_input}"}]
                 )
-                res_obj = {"q": query, "report": final_res.choices[0].message.content}
+                res_obj = {"q": query, "report": final.choices[0].message.content}
                 st.session_state.history.append(res_obj); st.session_state.view = res_obj
-                status.update(label="✅ Analysis Complete", state="complete")
-            except Exception as e: st.error(f"Synthesis failed: {e}")
+                status.update(label="✅ Complete", state="complete")
+            except Exception as e: st.error(f"Network limit reached. Try a shorter question.")
 
     if "view" in st.session_state:
-        v = st.session_state.view
         st.divider()
-        if st.button("📧 Email Report"): send_report(v['report'], v['q'])
-        st.markdown(v['report'])
+        st.markdown(f"### Results: {st.session_state.view['q']}")
+        st.markdown(st.session_state.view['report'])
+
