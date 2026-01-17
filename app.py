@@ -51,7 +51,7 @@ if check_password():
             # C. THE JUDGE (Direct Google bypass)
             st.write("⚖️ Final Audit...")
             try:
-                model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                model = genai.GenerativeModel('gemini-1.5-flash')
                 response = model.generate_content(f"You are the Final Judge. Synthesize this expert report: {expert_view}")
                 st.session_state.report = response.text
                 status.update(label="✅ Success", state="complete")
@@ -61,4 +61,5 @@ if check_password():
     if "report" in st.session_state:
         st.divider()
         st.markdown(st.session_state.report)
+
 
