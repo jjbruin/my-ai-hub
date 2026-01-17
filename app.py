@@ -7,7 +7,7 @@ from docx import Document
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-st.write("Available Keys:, list(st.secrets.keys()))
+st.write("Available Keys:", list(st.secrets.keys()))
 
 # --- 1. SECURITY: MULTI-USER LOGIN ---
 def check_password():
@@ -155,4 +155,5 @@ if check_password():
             if st.button("🗑️ Clear View"):
                 del st.session_state.view
                 st.rerun()
+
 
