@@ -7,16 +7,29 @@ from docx import Document
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# --- 1. SECURITY & UTILITIES ---
+# --- 1. SECURITY: MULTI-USER LOGIN ---
 def check_password():
-    if st.session_state.get("password_correct", False): return True
-    st.title("🔐 Secure Access Required")
-    pwd = st.text_input("Enter Hub Password", type="password")
-    if pwd == st.secrets["APP_PASSWORD"]:
-        st.session_state["password_correct"] = True
-        st.rerun()
+    """Returns True if the user provides a valid username and password."""
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.title("🔐 Secure Intelligence Hub Login")
+    user_input = st.text_input("Username")
+    password_input = st.text_input("Password", type="password")
+    
+    if st.button("Login"):
+        # Access the [passwords] section from your Streamlit Secrets
+        user_db = st.secrets.get("passwords", {})
+        
+        if user_input in user_db and hmac.compare_digest(password_input, user_db[user_input]):
+            st.session_state["password_correct"] = True
+            st.session_state["current_user"] = user_input
+            st.rerun()
+        else:
+            st.error("😕 Invalid username or password")
     return False
 
+# --- 2. DATA EXTRACTION UTILITIES ---
 def extract_text(file):
     try:
         ext = file.name.split('.')[-1].lower()
@@ -30,7 +43,7 @@ def extract_text(file):
 def send_report(text, subject):
     try:
         msg = MIMEMultipart()
-        msg['Subject'] = f"AI Research: {subject}"
+        msg['Subject'] = f"AI Research Report: {subject}"
         msg['From'] = st.secrets["EMAIL_SENDER"]
         msg['To'] = st.secrets["EMAIL_SENDER"]
         msg.attach(MIMEText(text, 'plain'))
@@ -38,104 +51,105 @@ def send_report(text, subject):
             server.starttls()
             server.login(st.secrets["EMAIL_SENDER"], st.secrets["EMAIL_APP_PASSWORD"])
             server.send_message(msg)
-        st.success("Report emailed successfully!")
+        st.success("Report emailed to your inbox!")
     except Exception as e:
-        st.error(f"Failed to send email: {e}")
+        st.error(f"Email failed: {e}")
 
-# --- 2. MAIN HUB APPLICATION ---
+# --- 3. MAIN APPLICATION INTERFACE ---
 if check_password():
     st.set_page_config(page_title="AI Intelligence Hub", layout="wide")
     
-    # Initialize session history
-    if "history" not in st.session_state: 
+    # Session state for History
+    if "history" not in st.session_state:
         st.session_state.history = []
 
-    # Sidebar for previous research
+    # Sidebar: User Info and History
     with st.sidebar:
-        st.title("📜 Research History")
+        st.success(f"User: {st.session_state['current_user']}")
+        st.divider()
+        st.header("📜 Research History")
         for i, h in enumerate(st.session_state.history):
-            if st.button(f"{i+1}. {h['q'][:20]}...", key=f"hist_{i}"): 
+            if st.button(f"{i+1}. {h['q'][:25]}...", key=f"h_{i}"):
                 st.session_state.view = h
 
     st.title("⚖️ Private AI Intelligence Hub")
-    st.info("Upload documents or ask a question. The Board will verify facts against the web.")
     
-    up_file = st.file_uploader("Upload internal data (PDF, CSV, DOCX)", type=['pdf', 'csv', 'docx'])
-    query = st.chat_input("Analyze data or search the world...")
+    # Inputs
+    up_file = st.file_uploader("Upload private files (PDF, CSV, DOCX)", type=['pdf', 'csv', 'docx'])
+    query = st.chat_input("Analyze your data or perform deep web research...")
 
     if query:
-        # Initialize clients with keys from Secrets
-        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86MjEwYmMyM2JhN2I4MmMzOWUyM2VkYWEzZTRlNmM3ZDc6NzplMjQ3OmMzN2YzMDRjY2JlMmRkMGVjNmNkNTEyMzJmNzczMTMzZmIxZWRhNWM5MzI0M2IwY2IwOWYyNjJjYTgyNTNiMDk6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
+        # Initialize API Clients
+        ai = OpenAI(base_url="https://url.avanan.click/v2/r01/___https://openrouter.ai/api/v1___.YXAzOnBlYWNlYWJsZXN0cmVldDphOm86ZmVkMGU4YThjNmUxMjQ0ODNmZjJiMjNkMWY3ZTNkOGQ6Nzo4ZThhOmFmMzA3YWQ4YTkzMDIzZjUxMTZlYzE0NWRiM2Q0ZTZiNGZiOTEwYTQxYjk1NDY1ZDQ2NjI2NzcyNWYwNDhlYmM6cDpUOkY", api_key=st.secrets["OPENROUTER_KEY"])
         tv = TavilyClient(api_key=st.secrets["TAVILY_KEY"])
         
-        # 1. Process document
+        # Safe extraction of uploaded file
         doc_txt = extract_text(up_file) if up_file else "No private document provided."
 
         with st.status("Gathering Intelligence...", expanded=True) as status:
-            # 2. Search the web
-            st.write("🔎 Performing web research...")
+            # A. Web Search
+            st.write("🔎 Performing live web audit...")
             try:
                 search_res = tv.search(query, search_depth="advanced")
                 web = "\n".join([r['content'] for r in search_res.get('results', [])])
                 if not web: web = "No relevant web results found."
-            except Exception:
+            except:
                 web = "Web search unavailable."
 
-            # 3. Consult Experts (with character limits to avoid BadRequest)
-            st.write("🤖 Consulting Expert Models...")
+            # B. Expert Consultation (Truncated to avoid BadRequest errors)
+            st.write("🤖 Consulting Board of Experts...")
             experts = ["anthropic/claude-3.5-sonnet", "openai/gpt-5-preview"]
             answers = []
-            
-            # Use truncated text (first 3000 chars) to prevent API errors
-            prompt_content = f"Document Snippet: {doc_txt[:3000]}\n\nWeb Facts: {web[:3000]}\n\nQuestion: {query}"
+            # Truncate inputs to 2500 chars each to keep the packet size small
+            p_content = f"Doc Snippet: {doc_txt[:2500]}\n\nWeb Facts: {web[:2500]}\n\nQuestion: {query}"
             
             for m in experts:
                 try:
                     res = ai.chat.completions.create(
                         model=m,
-                        messages=[{"role": "user", "content": prompt_content}]
+                        messages=[{"role": "user", "content": p_content}]
                     )
                     answers.append(res.choices[0].message.content)
                 except Exception as e:
-                    answers.append(f"Model {m} failed: {str(e)}")
+                    answers.append(f"Expert {m} unavailable: {str(e)}")
             
-            # 4. Final Audit & Comparison Table
-            st.write("⚖️ Finalizing Verified Report...")
+            # C. Final Synthesis (Consolidated to avoid CloudFront errors)
+            st.write("⚖️ Finalizing Consensus Audit...")
             try:
-                # Generate Comparison Table
-                table_p = f"Create a Markdown table comparing the different perspectives provided: {answers}"
-                table_res = ai.chat.completions.create(model="google/gemini-2.0-pro", messages=[{"role": "user", "content": table_p}])
+                # Combine experts into a summary for the judge
+                exp_summary = "\n\n".join([f"Expert {i+1} View: {ans[:1500]}" for i, ans in enumerate(answers)])
+                master_prompt = f"Create a Markdown comparison table and a unified report based on these expert views: {exp_summary}"
                 
-                # Generate Synthesis
-                final_p = f"Synthesize these expert views into one definitive, cited report: {answers}"
-                final_res = ai.chat.completions.create(model="google/gemini-2.0-pro", messages=[{"role": "user", "content": final_p}])
+                final_res = ai.chat.completions.create(
+                    model="google/gemini-2.0-pro",
+                    messages=[{"role": "user", "content": master_prompt}]
+                )
                 
-                res_obj = {
-                    "q": query, 
-                    "report": final_res.choices[0].message.content, 
-                    "table": table_res.choices[0].message.content
-                }
+                report_data = final_res.choices[0].message.content
+                res_obj = {"q": query, "report": report_data}
+                
+                # Update Session
                 st.session_state.history.append(res_obj)
                 st.session_state.view = res_obj
                 status.update(label="✅ Analysis Complete", state="complete")
             except Exception as e:
                 st.error(f"Final synthesis failed: {e}")
 
-    # Display results if available
+    # --- 4. DISPLAY RESULTS ---
     if "view" in st.session_state:
         v = st.session_state.view
         st.divider()
-        st.subheader(f"Results for: {v['q']}")
         
-        # Action Bar
-        if st.button("📧 Email Final Report"):
-            send_report(v['report'], v['q'])
-            
-        # Display Sections
-        col_a, col_b = st.columns([1, 2])
-        with col_a:
-            st.markdown("### 📊 Expert Comparison")
-            st.markdown(v['table'])
-        with col_b:
-            st.markdown("### 📝 Verified Final Report")
+        # Layout for Report and Actions
+        col_main, col_act = st.columns([4, 1])
+        with col_main:
+            st.subheader(f"Results: {v['q']}")
             st.markdown(v['report'])
+        
+        with col_act:
+            st.write("Actions")
+            if st.button("📧 Email Report"):
+                send_report(v['report'], v['q'])
+            if st.button("🗑️ Clear View"):
+                del st.session_state.view
+                st.rerun()
