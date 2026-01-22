@@ -1,107 +1,582 @@
+# app.py
+# Waterfall + XIRR Forecast
+# - Streamlit Cloud: forces Upload CSVs (no local C:\ paths)
+# - Sign normalization is now deal-agnostic and does NOT flip everything:
+#     * Gross revenues  -> +abs(mAmount)
+#     * Contra revenues (vacancy/concessions) -> -abs(mAmount)
+#     * Expenses -> -abs(mAmount)
+#     * Interest/Principal/Capex/Other excluded -> -abs(mAmount)
+# - Annual aggregation table: Years across columns; line items as rows
+#   formatting: commas, underline expenses, double line under NOI,
+#   separator before FAD, DSCR row below FAD, right-justified numbers,
+#   equal column widths.
+
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Dict, List, Tuple
+from pathlib import Path
+
+import pandas as pd
 import streamlit as st
-import hmac
-from openai import OpenAI
-from tavily import TavilyClient
-from google import genai
-from google.genai import types
-import time  # For retry logic
+from scipy.optimize import brentq
 
-# --- 1. LOGIN SYSTEM ---
-def check_password():
-    if st.session_state.get("password_correct", False): return True
-    st.title("🔐 Intelligence Hub Login")
-    u, p = st.text_input("Username"), st.text_input("Password", type="password")
-    if st.button("Login"):
-        db = st.secrets.get("passwords", {})
-        if u in db and hmac.compare_digest(p, db[u]):
-            st.session_state["password_correct"] = True
-            st.rerun()
-    return False
 
-# --- 2. MAIN APPLICATION ---
-if check_password():
-    st.set_page_config(page_title="Multi-Turn Hub", layout="wide")
-    st.title("⚖️ Live Multi-AI Chat Hub")
+# ============================================================
+# ENV DETECTION
+# ============================================================
+def is_streamlit_cloud() -> bool:
+    return Path("/mount/src").exists()
 
-    # Initialize History
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
 
-    # --- SIDEBAR: TOOLS & EXPORT ---
-    with st.sidebar:
-        st.header("🛠️ Chat Management")
-        if st.session_state.messages:
-            # Build chat stream for saving
-            chat_stream = "\n\n".join([f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages])
-            st.download_button(
-                label="📥 Save Chat Stream",
-                data=chat_stream,
-                file_name="intelligence_history.txt"
+# ============================================================
+# CONFIG
+# ============================================================
+DEFAULT_START_YEAR = 2026
+DEFAULT_HORIZON_YEARS = 10
+PRO_YR_BASE_DEFAULT = 2025
+
+# Contra-revenue (vacancy / concessions) - reduces revenue
+CONTRA_REVENUE_ACCTS = {4040, 4043, 4030, 4042}
+
+# Explicit account definitions (NO iNOI)
+# NOTE: Revenue set includes ALL revenue-related accounts; contra is handled separately in normalization.
+REVENUE_ACCTS = {
+    4010, 4012, 4020, 4041, 4045, 4040, 4043, 4030, 4042, 4070,
+    4091, 4092, 4090, 4097, 4093, 4094, 4096, 4095,
+    4063, 4060, 4061, 4062, 4080, 4065
+}
+
+# Gross revenues are revenues excluding contra-revenues
+GROSS_REVENUE_ACCTS = REVENUE_ACCTS - CONTRA_REVENUE_ACCTS
+
+EXPENSE_ACCTS = {
+    5090, 5110, 5114, 5018, 5010, 5016, 5012, 5014,
+    5051, 5053, 5050, 5052, 5054, 5055,
+    5060, 5067, 5063, 5069, 5061, 5064, 5065, 5068, 5070, 5066,
+    5020, 5022, 5021, 5023, 5025, 5026,
+    5045, 5080, 5087, 5085, 5040,
+    5096, 5095, 5091, 5100
+}
+
+INTEREST_ACCTS = {5190, 7030}
+PRINCIPAL_ACCTS = {7060}
+CAPEX_ACCTS = {7050}
+OTHER_EXCLUDED_ACCTS = {4050, 5220, 5210, 5195, 7065, 5120, 5130, 5400}
+
+ALL_EXCLUDED = INTEREST_ACCTS | PRINCIPAL_ACCTS | CAPEX_ACCTS | OTHER_EXCLUDED_ACCTS
+
+
+# ============================================================
+# UTILITIES
+# ============================================================
+def to_date(x) -> date:
+    return pd.to_datetime(x).date()
+
+
+def is_year_end(d: date) -> bool:
+    return d.month == 12 and d.day == 31
+
+
+def year_ends_strictly_between(d0: date, d1: date) -> List[date]:
+    if d1 <= d0:
+        return []
+    out: List[date] = []
+    y = d0.year
+    while True:
+        ye = date(y, 12, 31)
+        if ye >= d1:
+            break
+        if ye > d0:
+            out.append(ye)
+        y += 1
+    return out
+
+
+# ============================================================
+# XIRR
+# ============================================================
+def xnpv(rate: float, cfs: List[Tuple[date, float]]) -> float:
+    if rate <= -0.999999999:
+        return float("inf")
+    cfs = sorted(cfs, key=lambda t: t[0])
+    t0 = cfs[0][0]
+    return sum(a / ((1 + rate) ** ((d - t0).days / 365.0)) for d, a in cfs)
+
+
+def xirr(cfs: List[Tuple[date, float]]) -> float:
+    return brentq(lambda r: xnpv(r, cfs), -0.9999, 10.0)
+
+
+# ============================================================
+# STATE (scaffolding for later waterfall execution)
+# ============================================================
+@dataclass
+class PartnerState:
+    principal: float = 0.0
+    pref_accrued: float = 0.0
+    pref_capitalized: float = 0.0
+    irr_cashflows: List[Tuple[date, float]] = field(default_factory=list)
+
+    def base(self) -> float:
+        return self.principal + self.pref_capitalized
+
+
+@dataclass
+class DealState:
+    vcode: str
+    last_event_date: date
+    partners: Dict[str, PartnerState] = field(default_factory=dict)
+
+
+# ============================================================
+# ACCRUAL / COMPOUNDING (scaffolding)
+# ============================================================
+def compound_year_end(deal: DealState):
+    for ps in deal.partners.values():
+        ps.pref_capitalized += ps.pref_accrued
+        ps.pref_accrued = 0.0
+
+
+def accrue_to(deal: DealState, new_date: date, pref_rates: Dict[str, float]):
+    d0, d1 = deal.last_event_date, new_date
+    if d1 <= d0:
+        return
+
+    splits = year_ends_strictly_between(d0, d1)
+    dates = [d0] + splits + [d1]
+
+    for i in range(len(dates) - 1):
+        s, e = dates[i], dates[i + 1]
+        yf = (e - s).days / 365.0
+
+        for p, ps in deal.partners.items():
+            r = pref_rates.get(p, 0.0)
+            ps.pref_accrued += ps.base() * r * yf
+
+        if is_year_end(e) and e != d1:
+            compound_year_end(deal)
+
+
+# ============================================================
+# ACCOUNTING INGESTION (HISTORICAL scaffolding)
+# ============================================================
+def map_bucket(flag):
+    return "capital" if str(flag).upper() == "Y" else "pref"
+
+
+def apply_txn(ps: PartnerState, d: date, amt: float, bucket: str):
+    # NOTE: accounting-feed sign conventions will be finalized later.
+    ps.irr_cashflows.append((d, amt))
+
+    if bucket == "capital":
+        ps.principal += -amt if amt < 0 else -min(amt, ps.principal)
+    else:
+        if amt > 0:
+            pay = min(amt, ps.pref_accrued)
+            ps.pref_accrued -= pay
+            ps.pref_capitalized -= (amt - pay)
+        else:
+            ps.pref_accrued += -amt
+
+
+# ============================================================
+# LOADERS + SIGN NORMALIZATION
+# ============================================================
+def load_coa(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    coa.csv headers (per your feed):
+      vcode, vdescription, vtype, iNOI, vMisc, vAccountType
+
+    Join rule:
+      coa.vcode == forecast_feed.vAccount == accounting_feed.TypeID
+
+    NOTE: iNOI is ignored in all calculations per your request.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "vcode" not in df.columns:
+        raise ValueError("coa.csv is missing required column: vcode")
+
+    df = df.rename(columns={"vcode": "vAccount"})
+    df["vAccount"] = pd.to_numeric(df["vAccount"], errors="coerce").astype("Int64")
+
+    if "vAccountType" not in df.columns:
+        df["vAccountType"] = ""
+    df["vAccountType"] = df["vAccountType"].fillna("").astype(str).str.strip()
+
+    return df[["vAccount", "vAccountType"]]
+
+
+def normalize_forecast_signs(fc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Deal-agnostic normalization using explicit account sets:
+
+      - Gross Revenue accounts: +abs(mAmount)
+      - Contra-Revenue (vacancy/concessions): -abs(mAmount)
+      - Expense accounts: -abs(mAmount)
+      - Interest/Principal/Capex/Other excluded: -abs(mAmount)
+      - Other accounts: leave as-is (for future expansion)
+    """
+    out = fc.copy()
+    base = pd.to_numeric(out["mAmount"], errors="coerce").fillna(0.0)
+
+    is_gross_rev = out["vAccount"].isin(GROSS_REVENUE_ACCTS)
+    is_contra_rev = out["vAccount"].isin(CONTRA_REVENUE_ACCTS)
+    is_exp = out["vAccount"].isin(EXPENSE_ACCTS)
+    is_outflow = out["vAccount"].isin(ALL_EXCLUDED)
+
+    amt = base.copy()
+    # Apply sign conventions by category (order matters: contra-rev must end negative)
+    amt = amt.where(~is_gross_rev, base.abs())
+    amt = amt.where(~is_contra_rev, -base.abs())
+    amt = amt.where(~is_exp, -base.abs())
+    amt = amt.where(~is_outflow, -base.abs())
+
+    out["mAmount_norm"] = amt
+    return out
+
+
+def load_forecast(df: pd.DataFrame, coa: pd.DataFrame, pro_yr_base: int) -> pd.DataFrame:
+    """
+    Forecast feed columns (per your feed):
+      Vcode, dtEntry, vSource, vAccount, mAmount, Year, Qtr, Date, Pro_Yr
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    df = df.rename(columns={"Vcode": "vcode", "Date": "event_date"})
+    df["vcode"] = df["vcode"].astype(str)
+
+    df["event_date"] = pd.to_datetime(df["event_date"]).dt.date
+    df["vAccount"] = pd.to_numeric(df["vAccount"], errors="coerce").astype("Int64")
+    df["mAmount"] = pd.to_numeric(df["mAmount"], errors="coerce").fillna(0.0)
+
+    df["Year"] = (int(pro_yr_base) + pd.to_numeric(df["Pro_Yr"], errors="coerce")).astype("Int64")
+
+    # Join to COA (optional: for labeling / future use)
+    df = df.merge(coa, on="vAccount", how="left")
+    df["vAccountType"] = df["vAccountType"].fillna("").astype(str)
+
+    df = normalize_forecast_signs(df)
+    return df
+
+
+# ============================================================
+# ANNUAL AGGREGATION (Revenues → FAD by year) using explicit sets
+# ============================================================
+def annual_aggregation_table(fc_deal: pd.DataFrame, start_year: int, horizon_years: int) -> pd.DataFrame:
+    years = list(range(int(start_year), int(start_year) + int(horizon_years)))
+    f = fc_deal[fc_deal["Year"].isin(years)].copy()
+
+    def sum_where(mask: pd.Series) -> pd.Series:
+        if f.empty:
+            return pd.Series(dtype=float)
+        return f.loc[mask].groupby("Year")["mAmount_norm"].sum()
+
+    # Revenues include gross + contra (contra already negative after normalization)
+    revenues = sum_where(f["vAccount"].isin(GROSS_REVENUE_ACCTS | CONTRA_REVENUE_ACCTS))
+    expenses = sum_where(f["vAccount"].isin(EXPENSE_ACCTS))
+
+    interest = sum_where(f["vAccount"].isin(INTEREST_ACCTS))
+    principal = sum_where(f["vAccount"].isin(PRINCIPAL_ACCTS))
+    capex = sum_where(f["vAccount"].isin(CAPEX_ACCTS))
+    excluded_other = sum_where(f["vAccount"].isin(OTHER_EXCLUDED_ACCTS))
+
+    out = pd.DataFrame({"Year": years}).set_index("Year")
+
+    out["Revenues"] = revenues
+    out["Expenses"] = expenses
+
+    # Expenses are normalized negative; NOI = Revenues + Expenses
+    out["NOI"] = out["Revenues"].fillna(0.0) + out["Expenses"].fillna(0.0)
+
+    out["Interest"] = interest
+    out["Principal"] = principal
+    out["Total Debt Service"] = out["Interest"].fillna(0.0) + out["Principal"].fillna(0.0)
+
+    out["Excluded Accounts"] = excluded_other
+    out["Capital Expenditures"] = capex
+
+    # Interest/Principal/Excluded/Capex are normalized negative outflows:
+    out["Funds Available for Distribution"] = (
+        out["NOI"].fillna(0.0)
+        + out["Interest"].fillna(0.0)
+        + out["Principal"].fillna(0.0)
+        + out["Excluded Accounts"].fillna(0.0)
+        + out["Capital Expenditures"].fillna(0.0)
+    )
+
+    # DSCR = NOI / |Total Debt Service|
+    tds_abs = out["Total Debt Service"].abs().replace(0, pd.NA)
+    out["Debt Service Coverage Ratio"] = out["NOI"] / tds_abs
+
+    out = out.reset_index().fillna(0.0)
+    return out
+
+
+def pivot_annual_table(df: pd.DataFrame) -> pd.DataFrame:
+    wide = df.set_index("Year").T
+    wide.index.name = "Line Item"
+
+    desired_order = [
+        "Revenues",
+        "Expenses",
+        "NOI",
+        "Interest",
+        "Principal",
+        "Total Debt Service",
+        "Excluded Accounts",
+        "Capital Expenditures",
+        "Funds Available for Distribution",
+        "Debt Service Coverage Ratio",
+    ]
+    existing = [r for r in desired_order if r in wide.index]
+    remainder = [r for r in wide.index if r not in existing]
+    return wide.loc[existing + remainder]
+
+
+def style_annual_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    # Base formatter: dollars with commas
+    def money_fmt(x):
+        if pd.isna(x):
+            return ""
+        return f"{x:,.0f}"
+
+    # DSCR formatter
+    def dscr_fmt(x):
+        if pd.isna(x):
+            return ""
+        return f"{x:,.2f}"
+
+    styler = df.style.format(money_fmt)
+
+    # Override DSCR row formatting
+    if "Debt Service Coverage Ratio" in df.index:
+        styler = styler.format(
+            {col: dscr_fmt for col in df.columns},
+            subset=pd.IndexSlice[["Debt Service Coverage Ratio"], :]
+        )
+
+    # Equal column widths + alignment
+    styler = styler.set_table_styles(
+        [
+            {"selector": "th", "props": [("text-align", "left"), ("width", "220px")]},
+            {"selector": "td", "props": [("text-align", "right"), ("width", "140px")]},
+        ],
+        overwrite=False,
+    )
+
+    # Underline Expenses row
+    if "Expenses" in df.index:
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[["Expenses"], :],
+            **{"text-decoration": "underline"}
+        )
+
+    # Double line under NOI + bold NOI
+    if "NOI" in df.index:
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[["NOI"], :],
+            **{"border-bottom": "3px double black", "font-weight": "bold"}
+        )
+
+    # Line under the last row BEFORE Funds Available
+    if "Funds Available for Distribution" in df.index:
+        fad_idx = df.index.get_loc("Funds Available for Distribution")
+        if fad_idx > 0:
+            prev_row = df.index[fad_idx - 1]
+            styler = styler.set_properties(
+                subset=pd.IndexSlice[[prev_row], :],
+                **{"border-bottom": "2px solid black"}
             )
-        if st.button("🧹 New Conversation"):
-            st.session_state.messages = []
-            st.rerun()
 
-    # --- DISPLAY CHAT HISTORY ---
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Bold Funds Available
+    if "Funds Available for Distribution" in df.index:
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[["Funds Available for Distribution"], :],
+            **{"font-weight": "bold"}
+        )
 
-    # --- REACT TO USER INPUT ---
-    if prompt := st.chat_input("Ask a follow-up or a new question..."):
-        # Show and store user prompt
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # Separator above DSCR
+    if "Debt Service Coverage Ratio" in df.index:
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[["Debt Service Coverage Ratio"], :],
+            **{"border-top": "1px solid #999"}
+        )
 
-        # Clients
-        together_client = OpenAI(base_url="https://api.together.xyz/v1", api_key=st.secrets["TOGETHER_KEY"])
-        google_client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
-        tv_client = TavilyClient(api_key=st.secrets["TAVILY_KEY"])
+    return styler
 
-        with st.status("📡 Orchestrating Live Audit...", expanded=False) as status:
-            # A. LIVE SEARCH
-            try:
-                search = tv_client.search(prompt, search_depth="advanced", max_results=3)
-                live_context = "\n".join([r['content'] for r in search['results']])
-            except: live_context = "No new data found."
 
-            # B. EXPERTS
-            expert_reports = []
-            for name, m_id in {"Llama": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "Qwen": "Qwen/Qwen2.5-72B-Instruct-Turbo"}.items():
-                try:
-                    resp = expert_client.chat.completions.create(
-                        model=m_id,
-                        messages=[{"role": "system", "content": f"2026 Data: {live_context}"}, {"role": "user", "content": prompt}]
-                    )
-                    expert_reports.append(f"### {name}\n{resp.choices[0].message.content}")
-                except: expert_reports.append(f"### {name}\n[Model Overloaded]")
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+st.set_page_config(layout="wide")
+st.title("Waterfall + XIRR Forecast")
 
-            # C. THE JUDGE (With 503 Retry Logic)
-            final_answer = "Analysis failed after multiple attempts."
-            for attempt in range(3): # Try 3 times to bypass 503 errors
-                try:
-                    combined = "\n\n---\n\n".join(expert_reports)
-                    # Feed history for follow-up capability
-                    history_text = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[-3:]])
-                    
-                    response = google_client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=f"History: {history_text}\n\nExperts: {combined}\n\nLatest: {prompt}",
-                        config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=2000))
-                    )
-                    final_answer = response.text
-                    status.update(label="✅ Success", state="complete")
-                    break 
-                except Exception as e:
-                    if "503" in str(e):
-                        st.warning(f"Judge overloaded (Attempt {attempt+1}/3). Retrying in 2s...")
-                        time.sleep(2)
-                    else:
-                        final_answer = f"Error: {e}"
-                        break
+CLOUD = is_streamlit_cloud()
 
-        # Show and store Assistant response
-        with st.chat_message("assistant"):
-            st.markdown(final_answer)
-        st.session_state.messages.append({"role": "assistant", "content": final_answer})
+with st.sidebar:
+    st.header("Data Source")
+
+    if CLOUD:
+        mode = "Upload CSVs"
+        st.info("Running on Streamlit Cloud — local folders are disabled. Please upload CSVs.")
+    else:
+        mode = st.radio("Load data from:", ["Local folder", "Upload CSVs"], index=0)
+
+    folder = None
+    uploads = {}
+
+    if mode == "Local folder":
+        folder = st.text_input("Data folder path", placeholder=r"C:\Path\To\Data")
+        st.caption("Required: investment_map.csv, waterfalls.csv, coa.csv, accounting_feed.csv, forecast_feed.csv")
+    else:
+        uploads["investment_map"] = st.file_uploader("investment_map.csv", type="csv")
+        uploads["waterfalls"] = st.file_uploader("waterfalls.csv", type="csv")
+        uploads["coa"] = st.file_uploader("coa.csv", type="csv")
+        uploads["accounting_feed"] = st.file_uploader("accounting_feed.csv", type="csv")
+        uploads["forecast_feed"] = st.file_uploader("forecast_feed.csv", type="csv")
+
+    st.divider()
+    st.header("Report Settings")
+    start_year = st.number_input("Start year", min_value=2000, max_value=2100, value=DEFAULT_START_YEAR, step=1)
+    horizon_years = st.number_input("Horizon (years)", min_value=1, max_value=30, value=DEFAULT_HORIZON_YEARS, step=1)
+    pro_yr_base = st.number_input("Pro_Yr base year", min_value=1900, max_value=2100, value=PRO_YR_BASE_DEFAULT, step=1)
+
+
+# ============================================================
+# LOAD INPUTS
+# ============================================================
+def load_inputs():
+    if CLOUD and mode == "Local folder":
+        st.error("Local folder mode is disabled on Streamlit Cloud.")
+        st.stop()
+
+    if mode == "Local folder":
+        if not folder:
+            st.error("Please enter a data folder path.")
+            st.stop()
+
+        inv = pd.read_csv(f"{folder}/investment_map.csv")
+        wf = pd.read_csv(f"{folder}/waterfalls.csv")
+        coa = load_coa(pd.read_csv(f"{folder}/coa.csv"))
+        acct = pd.read_csv(f"{folder}/accounting_feed.csv")
+        fc = load_forecast(pd.read_csv(f"{folder}/forecast_feed.csv"), coa, int(pro_yr_base))
+    else:
+        for k, f in uploads.items():
+            if f is None:
+                st.warning(f"Please upload {k}.csv")
+                st.stop()
+
+        inv = pd.read_csv(uploads["investment_map"])
+        wf = pd.read_csv(uploads["waterfalls"])
+        coa = load_coa(pd.read_csv(uploads["coa"]))
+        acct = pd.read_csv(uploads["accounting_feed"])
+        fc = load_forecast(pd.read_csv(uploads["forecast_feed"]), coa, int(pro_yr_base))
+
+    inv["vcode"] = inv["vcode"].astype(str)
+    if "InvestmentID" in inv.columns:
+        inv["InvestmentID"] = inv["InvestmentID"].astype(str)
+
+    if "TypeID" in acct.columns:
+        acct["TypeID"] = pd.to_numeric(acct["TypeID"], errors="coerce").astype("Int64")
+
+    return inv, wf, coa, acct, fc
+
+
+inv, wf, coa, acct, fc = load_inputs()
+
+deal = st.selectbox("Select Deal", sorted(inv["vcode"].dropna().unique().tolist()))
+
+if not st.button("Run Report", type="primary"):
+    st.stop()
+
+
+# ============================================================
+# CONTROL POPULATION (INNER JOIN ON InvestmentID → vcode)
+# ============================================================
+if "InvestmentID" in acct.columns and "InvestmentID" in inv.columns:
+    acct["InvestmentID"] = acct["InvestmentID"].astype(str)
+    acct = acct.merge(inv[["InvestmentID", "vcode"]], on="InvestmentID", how="inner")
+    acct = acct[acct["vcode"] == deal].copy()
+else:
+    acct = pd.DataFrame()
+
+if acct.empty:
+    st.warning("No accounting data found for the selected deal (after InvestmentID→vcode control join).")
+
+
+# ============================================================
+# INITIALIZE DEAL STATE FROM WATERFALL (scaffolding)
+# ============================================================
+wf_d = wf[wf["vcode"].astype(str) == str(deal)].copy()
+if wf_d.empty:
+    st.error(f"No waterfall steps found for deal {deal}.")
+    st.stop()
+
+wf_d["dteffective"] = pd.to_datetime(wf_d["dteffective"]).dt.date
+start_date = wf_d["dteffective"].min()
+
+state = DealState(str(deal), start_date)
+for p in wf_d["PropCode"].astype(str).unique():
+    state.partners[p] = PartnerState()
+
+pref_rates: Dict[str, float] = {}
+if "vState" in wf_d.columns:
+    pref_rows = wf_d[wf_d["vState"].astype(str).str.strip().str.lower().eq("pref")]
+    for _, r in pref_rows.iterrows():
+        rate = float(r.get("nPercent") or 0.0)
+        if rate > 1.0:
+            rate /= 100.0
+        pref_rates[str(r["PropCode"])] = rate
+
+
+# ============================================================
+# APPLY HISTORICAL ACCOUNTING TO BUILD CURRENT STATE (placeholder)
+# ============================================================
+if not acct.empty and "EffectiveDate" in acct.columns and "InvestorID" in acct.columns:
+    acct["EffectiveDate"] = pd.to_datetime(acct["EffectiveDate"]).dt.date
+    acct["InvestorID"] = acct["InvestorID"].astype(str)
+
+    for _, r in acct.sort_values("EffectiveDate").iterrows():
+        d = r["EffectiveDate"]
+        accrue_to(state, d, pref_rates)
+
+        inv_id = r["InvestorID"]
+        if inv_id in state.partners:
+            apply_txn(
+                state.partners[inv_id],
+                d,
+                float(r.get("Amt", 0.0)),
+                map_bucket(r.get("Capital", "Y")),
+            )
+
+        state.last_event_date = d
+
+
+# ============================================================
+# ANNUAL AGGREGATION DISPLAY (Years across columns)
+# ============================================================
+st.subheader("Annual Operating Forecast (Revenues → Funds Available for Distribution)")
+
+fc_deal = fc[fc["vcode"].astype(str) == str(deal)].copy()
+if fc_deal.empty:
+    st.error(f"No forecast rows found for deal {deal}.")
+    st.stop()
+
+annual_df_raw = annual_aggregation_table(fc_deal, int(start_year), int(horizon_years))
+annual_df = pivot_annual_table(annual_df_raw)
+styled = style_annual_table(annual_df)
+
+st.dataframe(styled, use_container_width=True)
+
+st.caption(
+    "Definitions: Revenues include gross revenue accounts (+) and contra-revenue accounts (vacancy/concessions) as (-). "
+    "Expenses are always negative. NOI = Revenues + Expenses. "
+    "Funds Available for Distribution = NOI + Interest + Principal + Excluded + Capex. "
+    "DSCR = NOI / |Total Debt Service|."
+)
+
+st.success("Annual aggregation table generated successfully.")
+
